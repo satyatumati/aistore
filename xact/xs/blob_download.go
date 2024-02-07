@@ -30,20 +30,21 @@ import (
 // 2. track each chunk reader with 'started' timestamp; abort/retry individual chunks; timeout
 // 3. tune-up: (chunk size, slab size, full size) vs memory pressure
 
-// tunables (via apc.BlobMsg)
+// default tunables (can override via apc.BlobMsg)
 const (
 	dfltChunkSize  = 2 * cos.MiB
 	minChunkSize   = memsys.DefaultBufSize
 	maxChunkSize   = 16 * cos.MiB
 	dfltNumReaders = 4
 
-	maxInitialSizeSGL = 128 // vec length
-	maxTotalChunks    = 128 * cos.MiB
+	maxInitialSizeSGL = 128           // vec length
+	maxTotalChunks    = 128 * cos.MiB // max mem per blob downloader
 )
 
 type (
 	blobArgs struct {
 		lom        *core.LOM
+		expCksum   *cos.Cksum
 		lmfh       *os.File
 		wfqn       string
 		chunkSize  int64
@@ -87,17 +88,20 @@ var (
 )
 
 func RenewBlobDl(uuid string, lom *core.LOM, wfqn string, lmfh *os.File, msg *apc.BlobMsg) xreg.RenewRes {
-	fullSize := msg.FullSize
-	if fullSize == 0 {
-		oa, errCode, err := core.T.Backend(lom.Bck()).HeadObj(context.Background(), lom)
-		if err != nil {
-			return xreg.RenewRes{Err: err}
-		}
-		debug.Assert(errCode == 0)
-		fullSize = oa.Size
+	// HEAD(obj); fill-in custom md
+	fullSize, expCksum, err := _headObj(lom)
+	if err != nil {
+		return xreg.RenewRes{Err: err}
 	}
+	if msg.FullSize > 0 && msg.FullSize != fullSize {
+		nlog.Errorln("")
+		// name := apc.ActBlobDl + xact.LeftID + uuid + xact.RightID + "/" + r.p.args.lom.ObjName
+		// err = fmt.Errorf("%s: premature EOF: expected size %d, have %d",
+	}
+
 	args := &blobArgs{
 		lom:        lom,
+		expCksum:   expCksum,
 		lmfh:       lmfh,
 		wfqn:       wfqn,
 		chunkSize:  msg.ChunkSize,
@@ -128,6 +132,21 @@ func RenewBlobDl(uuid string, lom *core.LOM, wfqn string, lmfh *os.File, msg *ap
 	}
 
 	return xreg.RenewBucketXact(apc.ActBlobDl, lom.Bck(), xreg.Args{UUID: uuid, Custom: args})
+}
+
+func _headObj(lom *core.LOM) (fullSize int64, expCksum *cos.Cksum, _ error) {
+	oa, errCode, err := core.T.Backend(lom.Bck()).HeadObj(context.Background(), lom)
+	if err != nil {
+		return 0, nil, err
+	}
+	debug.Assert(errCode == 0)
+	fullSize = oa.Size
+
+	lom.SetCustomMD(oa.CustomMD)
+	lom.SetVersion(oa.Ver)
+	lom.SetAtimeUnix(oa.Atime)
+	expCksum = oa.Cksum
+	return fullSize, expCksum, nil
 }
 
 //
